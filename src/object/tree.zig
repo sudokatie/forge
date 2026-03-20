@@ -20,8 +20,8 @@ pub const Tree = struct {
 
 /// Parse tree from raw object data
 pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Tree {
-    var entries = std.ArrayList(TreeEntry).init(allocator);
-    errdefer entries.deinit();
+    var entries: std.ArrayList(TreeEntry) = .empty;
+    errdefer entries.deinit(allocator);
 
     var pos: usize = 0;
     while (pos < data.len) {
@@ -41,7 +41,7 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Tree {
         @memcpy(&sha, data[pos .. pos + 20]);
         pos += 20;
 
-        try entries.append(.{
+        try entries.append(allocator, .{
             .mode = mode,
             .name = name,
             .sha = sha,
@@ -49,22 +49,22 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Tree {
     }
 
     return Tree{
-        .entries = try entries.toOwnedSlice(),
+        .entries = try entries.toOwnedSlice(allocator),
         .allocator = allocator,
     };
 }
 
 /// Serialize tree for storage
 pub fn serialize(allocator: std.mem.Allocator, tree: Tree) ![]u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
 
     for (tree.entries) |entry| {
-        try result.writer().print("{o} {s}\x00", .{ entry.mode, entry.name });
-        try result.appendSlice(&entry.sha);
+        try result.writer(allocator).print("{o} {s}\x00", .{ entry.mode, entry.name });
+        try result.appendSlice(allocator, &entry.sha);
     }
 
-    return try result.toOwnedSlice();
+    return try result.toOwnedSlice(allocator);
 }
 
 test "tree parse" {

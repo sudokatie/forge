@@ -83,15 +83,15 @@ pub const ObjectStore = struct {
         defer self.allocator.free(file_path);
 
         // Compress and write
-        var data_to_compress = std.ArrayList(u8).init(self.allocator);
-        defer data_to_compress.deinit();
-        try data_to_compress.appendSlice(header);
-        try data_to_compress.appendSlice(content);
+        var data_to_compress: std.ArrayList(u8) = .empty;
+        defer data_to_compress.deinit(self.allocator);
+        try data_to_compress.appendSlice(self.allocator, header);
+        try data_to_compress.appendSlice(self.allocator, content);
 
-        var compressed = std.ArrayList(u8).init(self.allocator);
-        defer compressed.deinit();
+        var compressed: std.ArrayList(u8) = .empty;
+        defer compressed.deinit(self.allocator);
 
-        var compressor = try std.compress.zlib.compressor(compressed.writer(), .{});
+        var compressor = try std.compress.zlib.compressor(compressed.writer(self.allocator), .{});
         try compressor.writer().writeAll(data_to_compress.items);
         try compressor.finish();
 
@@ -119,8 +119,8 @@ pub const ObjectStore = struct {
         defer self.allocator.free(compressed);
 
         // Decompress
-        var decompressed = std.ArrayList(u8).init(self.allocator);
-        defer decompressed.deinit();
+        var decompressed: std.ArrayList(u8) = .empty;
+        defer decompressed.deinit(self.allocator);
 
         var fbs = std.io.fixedBufferStream(compressed);
         var decompressor = std.compress.zlib.decompressor(fbs.reader());
@@ -128,7 +128,7 @@ pub const ObjectStore = struct {
 
         while (true) {
             const byte = reader.readByte() catch break;
-            try decompressed.append(byte);
+            try decompressed.append(self.allocator, byte);
         }
 
         // Parse header

@@ -24,8 +24,8 @@ pub const Commit = struct {
 /// Parse commit from raw object data
 pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Commit {
     var tree: hash_mod.Sha1 = undefined;
-    var parents = std.ArrayList(hash_mod.Sha1).init(allocator);
-    errdefer parents.deinit();
+    var parents: std.ArrayList(hash_mod.Sha1) = .empty;
+    errdefer parents.deinit(allocator);
 
     var author: []const u8 = "";
     const author_time: i64 = 0;
@@ -55,7 +55,7 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Commit {
             tree = try hash_mod.fromHex(line[5..45]);
         } else if (std.mem.startsWith(u8, line, "parent ")) {
             const parent = try hash_mod.fromHex(line[7..47]);
-            try parents.append(parent);
+            try parents.append(allocator, parent);
         } else if (std.mem.startsWith(u8, line, "author ")) {
             author = line[7..];
             // TODO: parse timestamp
@@ -67,7 +67,7 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Commit {
 
     return Commit{
         .tree = tree,
-        .parents = try parents.toOwnedSlice(),
+        .parents = try parents.toOwnedSlice(allocator),
         .author = author,
         .author_time = author_time,
         .author_tz = author_tz,
@@ -81,10 +81,10 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Commit {
 
 /// Serialize commit for storage
 pub fn serialize(allocator: std.mem.Allocator, commit: Commit) ![]u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
 
-    const writer = result.writer();
+    const writer = result.writer(allocator);
     try writer.print("tree {s}\n", .{hash_mod.toHex(commit.tree)});
 
     for (commit.parents) |parent| {
@@ -95,7 +95,7 @@ pub fn serialize(allocator: std.mem.Allocator, commit: Commit) ![]u8 {
     try writer.print("committer {s}\n", .{commit.committer});
     try writer.print("\n{s}", .{commit.message});
 
-    return try result.toOwnedSlice();
+    return try result.toOwnedSlice(allocator);
 }
 
 test "commit parse empty" {

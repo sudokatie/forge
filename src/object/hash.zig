@@ -51,12 +51,12 @@ pub fn fromHex(hex: []const u8) !Sha1 {
     return result;
 }
 
-fn hexDigit(c: u8) !u4 {
+fn hexDigit(c: u8) !u8 {
     return switch (c) {
-        '0'...'9' => @intCast(c - '0'),
-        'a'...'f' => @intCast(c - 'a' + 10),
-        'A'...'F' => @intCast(c - 'A' + 10),
-        else => error.InvalidHexChar,
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => return error.InvalidHexChar,
     };
 }
 
