@@ -1,12 +1,11 @@
 // Diff subsystem - Myers diff and patch generation
-// TODO: Implement in Task 12
 
-pub const Edit = union(enum) {
-    insert: []const u8,
-    delete: []const u8,
-    equal: []const u8,
-};
+pub const myers = @import("myers.zig");
+pub const diff = myers.diff;
+pub const unifiedDiff = myers.unifiedDiff;
+pub const Edit = myers.Edit;
+pub const EditType = myers.EditType;
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    _ = myers;
 }
