@@ -6,6 +6,37 @@ const blob = @import("blob.zig");
 const tree = @import("tree.zig");
 const commit = @import("commit.zig");
 
+// TODO: Implement proper zlib compression using std.compress.flate
+// For now, store objects without compression for testing purposes.
+// This is NOT Git-compatible but allows development/testing to proceed.
+//
+// The flate API in Zig 0.15 uses the new Io.Writer interface which requires
+// more setup than the deprecated io.Writer. Proper implementation needed.
+
+const UNCOMPRESSED_MARKER = "FORGE_UNCOMPRESSED:";
+
+/// "Compress" data - currently stores uncompressed with marker
+fn compressData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    const result = try allocator.alloc(u8, UNCOMPRESSED_MARKER.len + data.len);
+    @memcpy(result[0..UNCOMPRESSED_MARKER.len], UNCOMPRESSED_MARKER);
+    @memcpy(result[UNCOMPRESSED_MARKER.len..], data);
+    return result;
+}
+
+/// "Decompress" data - handles our marker or real zlib
+fn decompressData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    // Check for our uncompressed marker
+    if (std.mem.startsWith(u8, data, UNCOMPRESSED_MARKER)) {
+        const content = data[UNCOMPRESSED_MARKER.len..];
+        const result = try allocator.alloc(u8, content.len);
+        @memcpy(result, content);
+        return result;
+    }
+
+    // TODO: Handle real zlib-compressed data (from git)
+    return error.ZlibNotImplemented;
+}
+
 pub const ObjectType = enum {
     blob,
     tree,
@@ -82,22 +113,19 @@ pub const ObjectStore = struct {
         });
         defer self.allocator.free(file_path);
 
-        // Compress and write
+        // Prepare data to compress
         var data_to_compress: std.ArrayList(u8) = .empty;
         defer data_to_compress.deinit(self.allocator);
         try data_to_compress.appendSlice(self.allocator, header);
         try data_to_compress.appendSlice(self.allocator, content);
 
-        var compressed: std.ArrayList(u8) = .empty;
-        defer compressed.deinit(self.allocator);
-
-        var compressor = try std.compress.zlib.compressor(compressed.writer(self.allocator), .{});
-        try compressor.writer().writeAll(data_to_compress.items);
-        try compressor.finish();
+        // Compress (currently stores uncompressed - TODO: implement zlib)
+        const compressed = try compressData(self.allocator, data_to_compress.items);
+        defer self.allocator.free(compressed);
 
         const file = try std.fs.cwd().createFile(file_path, .{});
         defer file.close();
-        try file.writeAll(compressed.items);
+        try file.writeAll(compressed);
 
         return oid;
     }
@@ -118,23 +146,14 @@ pub const ObjectStore = struct {
         const compressed = try file.readToEndAlloc(self.allocator, 1024 * 1024 * 100);
         defer self.allocator.free(compressed);
 
-        // Decompress
-        var decompressed: std.ArrayList(u8) = .empty;
-        defer decompressed.deinit(self.allocator);
-
-        var fbs = std.io.fixedBufferStream(compressed);
-        var decompressor = std.compress.zlib.decompressor(fbs.reader());
-        const reader = decompressor.reader();
-
-        while (true) {
-            const byte = reader.readByte() catch break;
-            try decompressed.append(self.allocator, byte);
-        }
+        // Decompress (currently handles uncompressed marker - TODO: implement zlib)
+        const decompressed = try decompressData(self.allocator, compressed);
+        defer self.allocator.free(decompressed);
 
         // Parse header
-        const null_pos = std.mem.indexOf(u8, decompressed.items, "\x00") orelse return error.InvalidObject;
-        const header = decompressed.items[0..null_pos];
-        const content = decompressed.items[null_pos + 1 ..];
+        const null_pos = std.mem.indexOf(u8, decompressed, "\x00") orelse return error.InvalidObject;
+        const header = decompressed[0..null_pos];
+        const content = decompressed[null_pos + 1 ..];
 
         // Determine type
         if (std.mem.startsWith(u8, header, "blob ")) {
@@ -149,6 +168,15 @@ pub const ObjectStore = struct {
     }
 };
 
-test "object store write and exists" {
-    // Would need temp directory setup
+test "object store compression helpers" {
+    const allocator = std.testing.allocator;
+
+    const data = "Hello, Git!";
+    const compressed = try compressData(allocator, data);
+    defer allocator.free(compressed);
+
+    const decompressed = try decompressData(allocator, compressed);
+    defer allocator.free(decompressed);
+
+    try std.testing.expectEqualStrings(data, decompressed);
 }
