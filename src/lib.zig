@@ -18,4 +18,5 @@ pub const Commit = object.Commit;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("test_integration.zig");
 }
