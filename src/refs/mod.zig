@@ -1,11 +1,11 @@
 // References subsystem - branches, tags, HEAD
-// TODO: Implement in Task 5
 
-pub const Ref = struct {
-    name: []const u8,
-    sha: [20]u8,
-};
+pub const ref = @import("ref.zig");
+pub const Ref = ref.Ref;
+pub const RefTarget = ref.RefTarget;
+pub const RefStore = ref.RefStore;
+pub const PackedRefs = ref.PackedRefs;
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    _ = ref;
 }
