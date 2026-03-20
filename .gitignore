@@ -1,14 +1,4 @@
-# Zig
-zig-out/
-zig-cache/
 .zig-cache/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Editor
-*.swp
-*.swo
-.idea/
-.vscode/
+zig-out/
+*.o
+*.a
