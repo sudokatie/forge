@@ -1,10 +1,10 @@
 // Protocol subsystem - HTTP and SSH transports
-// TODO: Implement in Task 16
 
-pub const Transport = struct {
-    // Placeholder
-};
+pub const pktline = @import("pktline.zig");
+pub const encode = pktline.encode;
+pub const Decoder = pktline.Decoder;
+pub const parseCapabilities = pktline.parseCapabilities;
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    _ = pktline;
 }
