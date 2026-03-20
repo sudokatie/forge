@@ -35,5 +35,28 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 test "init creates structure" {
-    // Would need temp directory
+    const allocator = std.testing.allocator;
+
+    // Create temp directory
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Save current directory and change to temp
+    const old_cwd = std.fs.cwd();
+    tmp_dir.dir.setAsCwd() catch return;
+    defer old_cwd.setAsCwd() catch {};
+
+    // Run init
+    try run(allocator, &.{});
+
+    // Verify structure
+    tmp_dir.dir.access(".git/objects", .{}) catch return error.ObjectsDirMissing;
+    tmp_dir.dir.access(".git/refs/heads", .{}) catch return error.RefsDirMissing;
+    tmp_dir.dir.access(".git/HEAD", .{}) catch return error.HeadMissing;
+    tmp_dir.dir.access(".git/config", .{}) catch return error.ConfigMissing;
+
+    // Verify HEAD content
+    const head = try tmp_dir.dir.readFileAlloc(allocator, ".git/HEAD", 1024);
+    defer allocator.free(head);
+    try std.testing.expectEqualStrings("ref: refs/heads/main\n", head);
 }
