@@ -1,10 +1,9 @@
 // Index subsystem - staging area
-// TODO: Implement in Task 6
 
-pub const Index = struct {
-    // Placeholder
-};
+pub const index = @import("index.zig");
+pub const Index = index.Index;
+pub const IndexEntry = index.IndexEntry;
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    _ = index;
 }
