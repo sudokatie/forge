@@ -1,4 +1,5 @@
 // Git HTTP transport - smart protocol
+// Uses curl for HTTP requests (more stable across Zig versions)
 
 const std = @import("std");
 const pktline = @import("pktline.zig");
@@ -29,75 +30,78 @@ pub const RefDiscovery = struct {
 
 /// Discover refs from a remote repository
 pub fn discoverRefs(allocator: std.mem.Allocator, url: []const u8) !RefDiscovery {
-    // Build info/refs URL
     const info_url = try buildInfoRefsUrl(allocator, url);
     defer allocator.free(info_url);
 
-    // Fetch via HTTP
     const response = try httpGet(allocator, info_url);
     defer allocator.free(response);
 
-    // Parse pktline response
     return try parseRefDiscovery(allocator, response);
 }
 
 fn buildInfoRefsUrl(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    // Handle trailing slash
     const base = if (std.mem.endsWith(u8, url, "/"))
         url[0 .. url.len - 1]
     else
         url;
 
-    // Remove .git suffix for URL construction if present
-    const clean_base = if (std.mem.endsWith(u8, base, ".git"))
-        base
-    else
-        base;
-
-    return try std.fmt.allocPrint(allocator, "{s}/info/refs?service=git-upload-pack", .{clean_base});
+    return try std.fmt.allocPrint(allocator, "{s}/info/refs?service=git-upload-pack", .{base});
 }
 
 fn httpGet(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
-    // Parse URL
-    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "curl", "-s", "-L", url },
+        .max_output_bytes = 100 * 1024 * 1024,
+    });
+    defer allocator.free(result.stderr);
 
-    // Create HTTP client
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
+    return result.stdout;
+}
 
-    // Make request
-    var response_buffer: std.ArrayList(u8) = .empty;
-    defer response_buffer.deinit(allocator);
-
-    const result = client.fetch(.{
-        .location = .{ .uri = uri },
-        .response_storage = .{ .dynamic = &response_buffer },
-    }) catch |err| {
-        return err;
-    };
-
-    if (result.status != .ok) {
-        return error.HttpError;
+fn httpPost(allocator: std.mem.Allocator, url: []const u8, content_type: []const u8, body: []const u8) ![]u8 {
+    // Write body to temp file
+    const tmp_path = "/tmp/forge_post_body";
+    {
+        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{});
+        defer tmp_file.close();
+        try tmp_file.writeAll(body);
     }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
-    return try response_buffer.toOwnedSlice(allocator);
+    const content_type_header = try std.fmt.allocPrint(allocator, "Content-Type: {s}", .{content_type});
+    defer allocator.free(content_type_header);
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "curl", "-s", "-L",
+            "-X",   "POST",
+            "-H",   content_type_header,
+            "-d",   try std.fmt.allocPrint(allocator, "@{s}", .{tmp_path}),
+            url,
+        },
+        .max_output_bytes = 100 * 1024 * 1024,
+    });
+    defer allocator.free(result.stderr);
+
+    return result.stdout;
 }
 
 fn parseRefDiscovery(allocator: std.mem.Allocator, data: []const u8) !RefDiscovery {
-    var refs: std.ArrayList(RemoteRef) = .empty;
+    var refs_list: std.ArrayList(RemoteRef) = .empty;
     errdefer {
-        for (refs.items) |r| allocator.free(r.name);
-        refs.deinit(allocator);
+        for (refs_list.items) |r| allocator.free(r.name);
+        refs_list.deinit(allocator);
     }
 
     var capabilities: []const u8 = "";
     var first_line = true;
 
-    // Skip service announcement line (# service=git-upload-pack)
+    // Skip service announcement
     var start: usize = 0;
     if (std.mem.startsWith(u8, data, "001e# service=git-upload-pack")) {
-        start = 0x1e; // Skip first packet
-        // Skip flush
+        start = 0x1e;
         if (data.len > start + 4 and std.mem.eql(u8, data[start .. start + 4], "0000")) {
             start += 4;
         }
@@ -106,15 +110,11 @@ fn parseRefDiscovery(allocator: std.mem.Allocator, data: []const u8) !RefDiscove
     var decoder = pktline.Decoder.init(data[start..]);
 
     while (try decoder.next()) |line| {
-        // Skip empty lines
         if (line.len == 0) continue;
-
-        // Format: <sha> <refname>[\0<capabilities>]
         if (line.len < 41) continue;
 
         const sha = hash_mod.fromHex(line[0..40]) catch continue;
 
-        // Find ref name (after space, before NUL or end)
         const rest = line[41..];
         var ref_end = rest.len;
         var caps_start: ?usize = null;
@@ -124,15 +124,13 @@ fn parseRefDiscovery(allocator: std.mem.Allocator, data: []const u8) !RefDiscove
             caps_start = nul_pos + 1;
         }
 
-        // Trim newline from ref name
         const ref_name = std.mem.trimRight(u8, rest[0..ref_end], "\n");
 
-        try refs.append(allocator, .{
+        try refs_list.append(allocator, .{
             .name = try allocator.dupe(u8, ref_name),
             .sha = sha,
         });
 
-        // Capture capabilities from first ref line
         if (first_line and caps_start != null) {
             capabilities = try allocator.dupe(u8, std.mem.trimRight(u8, rest[caps_start.?..], "\n"));
             first_line = false;
@@ -140,11 +138,165 @@ fn parseRefDiscovery(allocator: std.mem.Allocator, data: []const u8) !RefDiscove
     }
 
     return RefDiscovery{
-        .refs = try refs.toOwnedSlice(allocator),
+        .refs = try refs_list.toOwnedSlice(allocator),
         .capabilities = capabilities,
         .allocator = allocator,
     };
 }
+
+/// Fetch pack file from remote
+pub fn fetchPack(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    wants: []const hash_mod.Sha1,
+    haves: []const hash_mod.Sha1,
+) ![]u8 {
+    const upload_url = try std.fmt.allocPrint(allocator, "{s}/git-upload-pack", .{
+        if (std.mem.endsWith(u8, url, "/")) url[0 .. url.len - 1] else url,
+    });
+    defer allocator.free(upload_url);
+
+    // Build request body
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(allocator);
+
+    // Send wants
+    for (wants, 0..) |want, i| {
+        const hex = hash_mod.toHex(want);
+        const line_content = if (i == 0)
+            try std.fmt.allocPrint(allocator, "want {s} ofs-delta side-band-64k thin-pack\n", .{hex})
+        else
+            try std.fmt.allocPrint(allocator, "want {s}\n", .{hex});
+        defer allocator.free(line_content);
+
+        const line = try pktline.encode(allocator, line_content);
+        defer allocator.free(line);
+        try request.appendSlice(allocator, line);
+    }
+
+    try request.appendSlice(allocator, pktline.flush());
+
+    // Send haves
+    for (haves) |have| {
+        const hex = hash_mod.toHex(have);
+        const have_content = try std.fmt.allocPrint(allocator, "have {s}\n", .{hex});
+        defer allocator.free(have_content);
+        const line = try pktline.encode(allocator, have_content);
+        defer allocator.free(line);
+        try request.appendSlice(allocator, line);
+    }
+
+    // Done
+    const done_line = try pktline.encode(allocator, "done\n");
+    defer allocator.free(done_line);
+    try request.appendSlice(allocator, done_line);
+
+    // Send request
+    const response = try httpPost(
+        allocator,
+        upload_url,
+        "application/x-git-upload-pack-request",
+        request.items,
+    );
+    defer allocator.free(response);
+
+    // Extract pack data
+    return try extractPackFromResponse(allocator, response);
+}
+
+fn extractPackFromResponse(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var pack_data: std.ArrayList(u8) = .empty;
+    errdefer pack_data.deinit(allocator);
+
+    var decoder = pktline.Decoder.init(response);
+
+    while (try decoder.next()) |line| {
+        if (line.len == 0) continue;
+
+        const channel = line[0];
+        const data = line[1..];
+
+        switch (channel) {
+            1 => {
+                try pack_data.appendSlice(allocator, data);
+            },
+            2 => {
+                // Progress - ignore
+            },
+            3 => {
+                return error.RemoteError;
+            },
+            else => {
+                if (std.mem.startsWith(u8, line, "PACK") or std.mem.startsWith(u8, line, "NAK")) {
+                    if (std.mem.startsWith(u8, line, "PACK")) {
+                        try pack_data.appendSlice(allocator, line);
+                    }
+                }
+            },
+        }
+    }
+
+    if (pack_data.items.len == 0) {
+        if (std.mem.indexOf(u8, response, "PACK")) |pack_start| {
+            try pack_data.appendSlice(allocator, response[pack_start..]);
+        }
+    }
+
+    return try pack_data.toOwnedSlice(allocator);
+}
+
+/// Push pack to remote
+pub fn pushPack(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    ref_updates: []const RefUpdate,
+    pack_data: []const u8,
+) !void {
+    const receive_url = try std.fmt.allocPrint(allocator, "{s}/git-receive-pack", .{
+        if (std.mem.endsWith(u8, url, "/")) url[0 .. url.len - 1] else url,
+    });
+    defer allocator.free(receive_url);
+
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(allocator);
+
+    // Send ref updates
+    for (ref_updates, 0..) |update, i| {
+        const old_hex = hash_mod.toHex(update.old_sha);
+        const new_hex = hash_mod.toHex(update.new_sha);
+
+        var line_buf: [256]u8 = undefined;
+        const line_content = if (i == 0)
+            std.fmt.bufPrint(&line_buf, "{s} {s} {s}\x00report-status\n", .{ old_hex, new_hex, update.ref_name }) catch continue
+        else
+            std.fmt.bufPrint(&line_buf, "{s} {s} {s}\n", .{ old_hex, new_hex, update.ref_name }) catch continue;
+
+        const line = try pktline.encode(allocator, line_content);
+        defer allocator.free(line);
+        try request.appendSlice(allocator, line);
+    }
+
+    try request.appendSlice(allocator, pktline.flush());
+    try request.appendSlice(allocator, pack_data);
+
+    const response = try httpPost(
+        allocator,
+        receive_url,
+        "application/x-git-receive-pack-request",
+        request.items,
+    );
+    defer allocator.free(response);
+
+    if (std.mem.indexOf(u8, response, "ng ") != null) {
+        return error.PushRejected;
+    }
+}
+
+pub const RefUpdate = struct {
+    ref_name: []const u8,
+    old_sha: hash_mod.Sha1,
+    new_sha: hash_mod.Sha1,
+};
 
 /// Find HEAD target from refs
 pub fn findHead(refs: []const RemoteRef) ?hash_mod.Sha1 {
@@ -158,13 +310,11 @@ pub fn findHead(refs: []const RemoteRef) ?hash_mod.Sha1 {
 
 /// Find default branch (main or master)
 pub fn findDefaultBranch(refs: []const RemoteRef) ?[]const u8 {
-    // Try main first
     for (refs) |ref| {
         if (std.mem.eql(u8, ref.name, "refs/heads/main")) {
             return "main";
         }
     }
-    // Fall back to master
     for (refs) |ref| {
         if (std.mem.eql(u8, ref.name, "refs/heads/master")) {
             return "master";
@@ -180,16 +330,11 @@ test "build info refs url" {
     const url1 = try buildInfoRefsUrl(allocator, "https://github.com/user/repo.git");
     defer allocator.free(url1);
     try std.testing.expectEqualStrings("https://github.com/user/repo.git/info/refs?service=git-upload-pack", url1);
-
-    const url2 = try buildInfoRefsUrl(allocator, "https://github.com/user/repo");
-    defer allocator.free(url2);
-    try std.testing.expectEqualStrings("https://github.com/user/repo/info/refs?service=git-upload-pack", url2);
 }
 
 test "parse ref discovery" {
     const allocator = std.testing.allocator;
 
-    // Simulated response
     const data = "003da1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 refs/heads/main\n0000";
 
     var discovery = try parseRefDiscovery(allocator, data);

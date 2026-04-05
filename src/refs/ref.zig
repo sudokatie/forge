@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const hash_mod = @import("../object/hash.zig");
+const packed_mod = @import("packed.zig");
+const PackedRefs = packed_mod.PackedRefs;
 
 pub const Ref = struct {
     name: []const u8,
@@ -173,74 +175,6 @@ pub const RefStore = struct {
         }
     }
 };
-
-/// Packed refs file parser
-pub const PackedRefs = struct {
-    refs: []PackedRef,
-    allocator: std.mem.Allocator,
-
-    pub const PackedRef = struct {
-        name: []const u8,
-        sha: hash_mod.Sha1,
-    };
-
-    pub fn load(allocator: std.mem.Allocator, git_dir: []const u8) !PackedRefs {
-        const path = try std.fmt.allocPrint(allocator, "{s}/packed-refs", .{git_dir});
-        defer allocator.free(path);
-
-        const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
-            if (err == error.FileNotFound) {
-                return PackedRefs{ .refs = &.{}, .allocator = allocator };
-            }
-            return err;
-        };
-        defer allocator.free(content);
-
-        var refs: std.ArrayList(PackedRef) = .empty;
-        errdefer refs.deinit(allocator);
-
-        var lines = std.mem.splitSequence(u8, content, "\n");
-        while (lines.next()) |line| {
-            // Skip comments and empty lines
-            if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
-
-            // Format: <sha> <refname>
-            if (line.len < 41) continue;
-
-            const sha = hash_mod.fromHex(line[0..40]) catch continue;
-            const name = std.mem.trimLeft(u8, line[40..], " ");
-
-            try refs.append(allocator, .{
-                .name = try allocator.dupe(u8, name),
-                .sha = sha,
-            });
-        }
-
-        return PackedRefs{
-            .refs = try refs.toOwnedSlice(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn lookup(self: PackedRefs, ref_name: []const u8) ?hash_mod.Sha1 {
-        for (self.refs) |ref| {
-            if (std.mem.eql(u8, ref.name, ref_name)) {
-                return ref.sha;
-            }
-        }
-        return null;
-    }
-
-    pub fn deinit(self: *const PackedRefs) void {
-        for (self.refs) |ref| {
-            self.allocator.free(ref.name);
-        }
-        if (self.refs.len > 0) {
-            self.allocator.free(self.refs);
-        }
-    }
-};
-
 // Tests
 test "parse symbolic ref" {
     const content = "ref: refs/heads/main";

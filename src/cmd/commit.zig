@@ -40,8 +40,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Get parent commit (if any)
     var ref_store = refs.RefStore.init(allocator, ".git");
-    const parent = ref_store.readHead() catch |err| {
-        if (err == error.HeadNotFound) null else return err;
+    const parent = ref_store.readHead() catch |err| blk: {
+        if (err == error.HeadNotFound) break :blk null else return err;
     };
 
     var parent_sha: ?object.Sha1 = null;
@@ -89,7 +89,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 const cwd = std.fs.cwd();
                 const head_file = try cwd.createFile(".git/HEAD", .{});
                 defer head_file.close();
-                try head_file.writer().print("{s}\n", .{object.hash.toHex(commit_sha)});
+                var hex_buf: [41]u8 = undefined;
+                const hex = object.hash.toHex(commit_sha);
+                @memcpy(hex_buf[0..40], &hex);
+                hex_buf[40] = '\n';
+                try head_file.writeAll(&hex_buf);
             },
         }
     } else {

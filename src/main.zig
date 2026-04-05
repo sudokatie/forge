@@ -72,10 +72,26 @@ fn runCommand(allocator: std.mem.Allocator, command: []const u8, args: []const [
         try cmd.fetch.run(allocator, args);
     } else if (std.mem.eql(u8, command, "push")) {
         try cmd.push.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "tag")) {
+        try cmd.tag.run(allocator, args);
     } else if (std.mem.eql(u8, command, "hash-object")) {
         try cmd.hash_object.run(allocator, args);
     } else if (std.mem.eql(u8, command, "cat-file")) {
         try cmd.cat_file.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "ls-tree")) {
+        try cmd.ls_tree.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "ls-files")) {
+        try cmd.ls_files.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "write-tree")) {
+        try cmd.write_tree.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "commit-tree")) {
+        try cmd.commit_tree.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "rev-parse")) {
+        try cmd.rev_parse.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "update-ref")) {
+        try cmd.update_ref.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "update-index")) {
+        try cmd.update_index.run(allocator, args);
     } else {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "forge: '{s}' is not a forge command. See 'forge --help'.\n", .{command}) catch {
@@ -109,6 +125,7 @@ fn printUsage() void {
         \\   branch      List, create, or delete branches
         \\   commit      Record changes to the repository
         \\   checkout    Switch branches or restore files
+        \\   tag         Create, list, or delete tags
         \\
         \\collaborate:
         \\   fetch       Download objects and refs from remote

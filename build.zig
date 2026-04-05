@@ -13,6 +13,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    
+    // Link against system zlib for Git-compatible compression
+    exe.linkSystemLibrary("z");
+    exe.linkLibC();
+    
     b.installArtifact(exe);
 
     // Run command
@@ -32,6 +37,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    
+    // Link zlib for tests too
+    lib_tests.linkSystemLibrary("z");
+    lib_tests.linkLibC();
+    
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     const test_step = b.step("test", "Run unit tests");

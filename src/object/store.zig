@@ -5,36 +5,68 @@ const hash_mod = @import("hash.zig");
 const blob = @import("blob.zig");
 const tree = @import("tree.zig");
 const commit = @import("commit.zig");
+const tag = @import("tag.zig");
 
-// TODO: Implement proper zlib compression using std.compress.flate
-// For now, store objects without compression for testing purposes.
-// This is NOT Git-compatible but allows development/testing to proceed.
-//
-// The flate API in Zig 0.15 uses the new Io.Writer interface which requires
-// more setup than the deprecated io.Writer. Proper implementation needed.
+// Use system zlib for Git-compatible compression
+const c = @cImport({
+    @cInclude("zlib.h");
+});
 
-const UNCOMPRESSED_MARKER = "FORGE_UNCOMPRESSED:";
-
-/// "Compress" data - currently stores uncompressed with marker
+/// Compress data using zlib (Git-compatible)
 fn compressData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    const result = try allocator.alloc(u8, UNCOMPRESSED_MARKER.len + data.len);
-    @memcpy(result[0..UNCOMPRESSED_MARKER.len], UNCOMPRESSED_MARKER);
-    @memcpy(result[UNCOMPRESSED_MARKER.len..], data);
-    return result;
-}
+    // Calculate upper bound for compressed size
+    const bound = c.compressBound(@intCast(data.len));
+    const compressed = try allocator.alloc(u8, bound);
+    errdefer allocator.free(compressed);
 
-/// "Decompress" data - handles our marker or real zlib
-fn decompressData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    // Check for our uncompressed marker
-    if (std.mem.startsWith(u8, data, UNCOMPRESSED_MARKER)) {
-        const content = data[UNCOMPRESSED_MARKER.len..];
-        const result = try allocator.alloc(u8, content.len);
-        @memcpy(result, content);
-        return result;
+    var dest_len: c_ulong = bound;
+    const result = c.compress(
+        compressed.ptr,
+        &dest_len,
+        data.ptr,
+        @intCast(data.len),
+    );
+
+    if (result != c.Z_OK) {
+        return error.CompressionFailed;
     }
 
-    // TODO: Handle real zlib-compressed data (from git)
-    return error.ZlibNotImplemented;
+    // Shrink to actual size
+    return allocator.realloc(compressed, dest_len);
+}
+
+/// Decompress zlib data (Git-compatible)
+fn decompressData(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    // Start with a reasonable buffer, grow if needed
+    var dest_size: usize = data.len * 4;
+    if (dest_size < 1024) dest_size = 1024;
+
+    while (true) {
+        const decompressed = try allocator.alloc(u8, dest_size);
+        errdefer allocator.free(decompressed);
+
+        var dest_len: c_ulong = @intCast(dest_size);
+        const result = c.uncompress(
+            decompressed.ptr,
+            &dest_len,
+            data.ptr,
+            @intCast(data.len),
+        );
+
+        if (result == c.Z_OK) {
+            // Shrink to actual size
+            return allocator.realloc(decompressed, dest_len);
+        } else if (result == c.Z_BUF_ERROR) {
+            // Buffer too small, grow and retry
+            allocator.free(decompressed);
+            dest_size *= 2;
+            if (dest_size > 1024 * 1024 * 100) {
+                return error.DecompressionBufferTooLarge;
+            }
+        } else {
+            return error.DecompressionFailed;
+        }
+    }
 }
 
 pub const ObjectType = enum {
@@ -48,7 +80,7 @@ pub const Object = union(ObjectType) {
     blob: blob.Blob,
     tree: tree.Tree,
     commit: commit.Commit,
-    tag: void, // TODO
+    tag: tag.Tag,
 };
 
 pub const ObjectStore = struct {
@@ -94,6 +126,11 @@ pub const ObjectStore = struct {
         hasher.update(content);
         const oid = hasher.finalResult();
 
+        // Check if already exists
+        if (self.exists(oid)) {
+            return oid;
+        }
+
         // Write compressed object
         const hex = hash_mod.toHex(oid);
         const dir_path = try std.fmt.allocPrint(self.allocator, "{s}/objects/{s}", .{
@@ -119,7 +156,7 @@ pub const ObjectStore = struct {
         try data_to_compress.appendSlice(self.allocator, header);
         try data_to_compress.appendSlice(self.allocator, content);
 
-        // Compress (currently stores uncompressed - TODO: implement zlib)
+        // Compress with zlib
         const compressed = try compressData(self.allocator, data_to_compress.items);
         defer self.allocator.free(compressed);
 
@@ -130,8 +167,8 @@ pub const ObjectStore = struct {
         return oid;
     }
 
-    /// Read object by SHA-1
-    pub fn read(self: *ObjectStore, oid: hash_mod.Sha1) !Object {
+    /// Read raw object data by SHA-1 (returns type string and content)
+    pub fn readRaw(self: *ObjectStore, oid: hash_mod.Sha1) !struct { type_str: []const u8, content: []const u8, data: []u8 } {
         const hex = hash_mod.toHex(oid);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/objects/{s}/{s}", .{
             self.git_dir,
@@ -146,34 +183,104 @@ pub const ObjectStore = struct {
         const compressed = try file.readToEndAlloc(self.allocator, 1024 * 1024 * 100);
         defer self.allocator.free(compressed);
 
-        // Decompress (currently handles uncompressed marker - TODO: implement zlib)
+        // Decompress with zlib
         const decompressed = try decompressData(self.allocator, compressed);
-        defer self.allocator.free(decompressed);
 
         // Parse header
-        const null_pos = std.mem.indexOf(u8, decompressed, "\x00") orelse return error.InvalidObject;
+        const null_pos = std.mem.indexOf(u8, decompressed, "\x00") orelse {
+            self.allocator.free(decompressed);
+            return error.InvalidObject;
+        };
         const header = decompressed[0..null_pos];
         const content = decompressed[null_pos + 1 ..];
 
-        // Determine type
-        if (std.mem.startsWith(u8, header, "blob ")) {
-            return Object{ .blob = blob.parse(content) };
-        } else if (std.mem.startsWith(u8, header, "tree ")) {
-            return Object{ .tree = try tree.parse(self.allocator, content) };
-        } else if (std.mem.startsWith(u8, header, "commit ")) {
-            return Object{ .commit = try commit.parse(self.allocator, content) };
+        // Find type
+        const space_pos = std.mem.indexOf(u8, header, " ") orelse {
+            self.allocator.free(decompressed);
+            return error.InvalidObject;
+        };
+        const type_str = header[0..space_pos];
+
+        return .{ .type_str = type_str, .content = content, .data = decompressed };
+    }
+
+    /// Read object by SHA-1
+    pub fn read(self: *ObjectStore, oid: hash_mod.Sha1) !Object {
+        const raw = try self.readRaw(oid);
+        defer self.allocator.free(raw.data);
+
+        // Determine type and parse
+        if (std.mem.eql(u8, raw.type_str, "blob")) {
+            return Object{ .blob = blob.parse(raw.content) };
+        } else if (std.mem.eql(u8, raw.type_str, "tree")) {
+            return Object{ .tree = try tree.parse(self.allocator, raw.content) };
+        } else if (std.mem.eql(u8, raw.type_str, "commit")) {
+            return Object{ .commit = try commit.parse(self.allocator, raw.content) };
+        } else if (std.mem.eql(u8, raw.type_str, "tag")) {
+            return Object{ .tag = try tag.parse(self.allocator, raw.content) };
         }
 
         return error.UnknownObjectType;
     }
+
+    /// Get object type and size without fully parsing
+    pub fn statObject(self: *ObjectStore, oid: hash_mod.Sha1) !struct { obj_type: ObjectType, size: usize } {
+        const raw = try self.readRaw(oid);
+        defer self.allocator.free(raw.data);
+
+        const obj_type: ObjectType = if (std.mem.eql(u8, raw.type_str, "blob"))
+            .blob
+        else if (std.mem.eql(u8, raw.type_str, "tree"))
+            .tree
+        else if (std.mem.eql(u8, raw.type_str, "commit"))
+            .commit
+        else if (std.mem.eql(u8, raw.type_str, "tag"))
+            .tag
+        else
+            return error.UnknownObjectType;
+
+        return .{ .obj_type = obj_type, .size = raw.content.len };
+    }
 };
 
-test "object store compression helpers" {
+test "zlib compression roundtrip" {
     const allocator = std.testing.allocator;
 
-    const data = "Hello, Git!";
+    const data = "Hello, Git! This is a test of zlib compression.";
     const compressed = try compressData(allocator, data);
     defer allocator.free(compressed);
+
+    // Compressed should be different
+    try std.testing.expect(!std.mem.eql(u8, data, compressed));
+
+    const decompressed = try decompressData(allocator, compressed);
+    defer allocator.free(decompressed);
+
+    try std.testing.expectEqualStrings(data, decompressed);
+}
+
+test "compress empty data" {
+    const allocator = std.testing.allocator;
+
+    const compressed = try compressData(allocator, "");
+    defer allocator.free(compressed);
+
+    const decompressed = try decompressData(allocator, compressed);
+    defer allocator.free(decompressed);
+
+    try std.testing.expectEqualStrings("", decompressed);
+}
+
+test "compress large data" {
+    const allocator = std.testing.allocator;
+
+    // Create large repetitive data (compresses well)
+    const data = "ABCDEFGHIJ" ** 1000;
+    const compressed = try compressData(allocator, data);
+    defer allocator.free(compressed);
+
+    // Should be significantly smaller
+    try std.testing.expect(compressed.len < data.len);
 
     const decompressed = try decompressData(allocator, compressed);
     defer allocator.free(decompressed);
