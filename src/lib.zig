@@ -8,6 +8,7 @@ pub const refs = @import("refs/mod.zig");
 pub const index = @import("index/mod.zig");
 pub const diff = @import("diff/mod.zig");
 pub const protocol = @import("protocol/mod.zig");
+pub const lfs = @import("lfs/mod.zig");
 
 // Re-export common types
 pub const Sha1 = object.Sha1;
@@ -15,6 +16,10 @@ pub const ObjectStore = object.ObjectStore;
 pub const Blob = object.Blob;
 pub const Tree = object.Tree;
 pub const Commit = object.Commit;
+
+// LFS types
+pub const LfsPointer = lfs.Pointer;
+pub const LfsObjectStore = lfs.ObjectStore;
 
 test {
     @import("std").testing.refAllDecls(@This());
