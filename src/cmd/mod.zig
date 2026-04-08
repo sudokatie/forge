@@ -13,6 +13,7 @@ pub const clone = @import("clone.zig");
 pub const fetch = @import("fetch.zig");
 pub const push = @import("push.zig");
 pub const tag = @import("tag.zig");
+pub const rebase = @import("rebase.zig");
 
 // Plumbing commands
 pub const hash_object = @import("hash_object.zig");
