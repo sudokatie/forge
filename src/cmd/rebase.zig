@@ -196,7 +196,7 @@ pub const RebaseCommand = struct {
     }
 
     /// Print current rebase status
-    fn printStatus(self: *Self, engine: *rebase_mod.RebaseEngine) !void {
+    fn printStatus(_: *Self, engine: *rebase_mod.RebaseEngine) !void {
         if (!engine.isInProgress()) {
             std.debug.print("No rebase in progress\n", .{});
             return;
@@ -249,6 +249,6 @@ pub fn run(allocator: std.mem.Allocator, git_dir: []const u8, args: []const []co
 
 test "rebase command initialization" {
     const allocator = std.testing.allocator;
-    var cmd = RebaseCommand.init(allocator, "/tmp/test/.git");
+    const cmd = RebaseCommand.init(allocator, "/tmp/test/.git");
     _ = cmd;
 }

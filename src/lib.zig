@@ -10,6 +10,7 @@ pub const diff = @import("diff/mod.zig");
 pub const protocol = @import("protocol/mod.zig");
 pub const lfs = @import("lfs/mod.zig");
 pub const rebase = @import("rebase/mod.zig");
+pub const merge = @import("merge/mod.zig");
 
 // Re-export common types
 pub const Sha1 = object.Sha1;

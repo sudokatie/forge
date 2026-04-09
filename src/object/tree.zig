@@ -2,12 +2,16 @@
 
 const std = @import("std");
 const hash_mod = @import("hash.zig");
+const store_mod = @import("store.zig");
 
 pub const TreeEntry = struct {
     mode: u32,
     name: []const u8,
     sha: hash_mod.Sha1,
 };
+
+// Alias for compatibility
+pub const Entry = TreeEntry;
 
 pub const Tree = struct {
     entries: []TreeEntry,
@@ -65,6 +69,31 @@ pub fn serialize(allocator: std.mem.Allocator, tree: Tree) ![]u8 {
     }
 
     return try result.toOwnedSlice(allocator);
+}
+
+/// Serialize entries for storage
+pub fn serializeEntries(allocator: std.mem.Allocator, entries: []const TreeEntry) ![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    for (entries) |entry| {
+        try result.writer(allocator).print("{o} {s}\x00", .{ entry.mode, entry.name });
+        try result.appendSlice(allocator, &entry.sha);
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Write a tree object to the store and return its hash
+pub fn writeTree(
+    allocator: std.mem.Allocator,
+    store: *store_mod.ObjectStore,
+    entries: []const TreeEntry,
+) !hash_mod.Sha1 {
+    const content = try serializeEntries(allocator, entries);
+    defer allocator.free(content);
+
+    return try store.write(allocator, store_mod.ObjectType.tree, content);
 }
 
 test "tree parse" {

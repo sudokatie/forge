@@ -5,7 +5,9 @@ const std = @import("std");
 const hash_mod = @import("../object/hash.zig");
 const store_mod = @import("../object/store.zig");
 const commit_mod = @import("../object/commit.zig");
+const tree_mod = @import("../object/tree.zig");
 const refs_mod = @import("../refs/ref.zig");
+const merge_mod = @import("../merge/mod.zig");
 const todo = @import("todo.zig");
 
 pub const RebaseError = error{
@@ -323,23 +325,55 @@ pub const RebaseEngine = struct {
         reword: bool,
         state: *RebaseState,
     ) !bool {
-        _ = reword;
-        // Read commit
+        // Read the commit to cherry-pick
         const commit_data = try self.store.read(self.allocator, commit_hash);
         defer self.allocator.free(commit_data);
 
         const commit = try commit_mod.parse(self.allocator, commit_data);
         defer @constCast(&commit).deinit();
 
-        // For a full implementation, we would:
-        // 1. Compute diff between commit's parent and commit
-        // 2. Apply that diff to current working tree
-        // 3. Handle conflicts
-        // 4. Create new commit with same message but new parent
+        // Get the commit's parent (for three-way merge base)
+        var parent_tree: ?hash_mod.Sha1 = null;
+        if (commit.parents.len > 0) {
+            const parent_data = try self.store.read(self.allocator, commit.parents[0]);
+            defer self.allocator.free(parent_data);
+            const parent_commit = try commit_mod.parse(self.allocator, parent_data);
+            defer @constCast(&parent_commit).deinit();
+            parent_tree = parent_commit.tree;
+        }
 
-        // For now, create the commit structure (actual tree ops need index support)
-        const new_commit_hash = try self.createCommit(
+        // Read current HEAD tree
+        const head_data = try self.store.read(self.allocator, state.head);
+        defer self.allocator.free(head_data);
+        const head_commit = try commit_mod.parse(self.allocator, head_data);
+        defer @constCast(&head_commit).deinit();
+        const head_tree = head_commit.tree;
+
+        // Three-way merge: parent_tree (base) -> commit.tree (theirs) applied to head_tree (ours)
+        const merge_result = try merge_mod.mergeTrees(
+            self.allocator,
+            self.store,
+            parent_tree,
+            head_tree,
             commit.tree,
+            .{
+                .ours_label = "HEAD",
+                .theirs_label = commit_hash.toHex()[0..7],
+            },
+        );
+        defer self.allocator.free(merge_result.conflicts);
+
+        // Check for conflicts
+        if (merge_result.conflicts.len > 0) {
+            // Write conflict entries to index (would need index access here)
+            // For now, save conflict info to rebase state and stop
+            try self.writeConflicts(merge_result.conflicts);
+            return true; // Stop for conflict resolution
+        }
+
+        // Create new commit with merged tree
+        const new_commit_hash = try self.createCommit(
+            merge_result.tree,
             state.head,
             commit.author,
             commit.author_time,
@@ -350,7 +384,39 @@ pub const RebaseEngine = struct {
         state.head = new_commit_hash;
         try self.refs.updateHead(new_commit_hash);
 
-        return false;
+        // If reword, stop for message editing
+        return reword;
+    }
+
+    /// Write conflict info to rebase directory
+    fn writeConflicts(self: *Self, conflicts: []const merge_mod.ConflictEntry) !void {
+        const conflicts_path = try std.fs.path.join(self.allocator, &.{ self.git_dir, REBASE_DIR, "conflicts" });
+        defer self.allocator.free(conflicts_path);
+
+        const file = try std.fs.createFileAbsolute(conflicts_path, .{});
+        defer file.close();
+
+        const writer = file.writer();
+        for (conflicts) |c| {
+            try writer.print("{s}\n", .{c.path});
+        }
+    }
+
+    /// Check if there are unresolved conflicts
+    pub fn hasConflicts(self: *Self) bool {
+        const conflicts_path = std.fs.path.join(self.allocator, &.{ self.git_dir, REBASE_DIR, "conflicts" }) catch return false;
+        defer self.allocator.free(conflicts_path);
+
+        std.fs.accessAbsolute(conflicts_path, .{}) catch return false;
+        return true;
+    }
+
+    /// Clear conflict markers after resolution
+    pub fn clearConflicts(self: *Self) !void {
+        const conflicts_path = try std.fs.path.join(self.allocator, &.{ self.git_dir, REBASE_DIR, "conflicts" });
+        defer self.allocator.free(conflicts_path);
+
+        std.fs.deleteFileAbsolute(conflicts_path) catch {};
     }
 
     /// Squash/fixup a commit
