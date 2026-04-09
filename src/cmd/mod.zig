@@ -14,6 +14,7 @@ pub const fetch = @import("fetch.zig");
 pub const push = @import("push.zig");
 pub const tag = @import("tag.zig");
 pub const rebase = @import("rebase.zig");
+pub const submodule = @import("submodule.zig");
 
 // Plumbing commands
 pub const hash_object = @import("hash_object.zig");

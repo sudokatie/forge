@@ -92,6 +92,8 @@ fn runCommand(allocator: std.mem.Allocator, command: []const u8, args: []const [
         try cmd.update_ref.run(allocator, args);
     } else if (std.mem.eql(u8, command, "update-index")) {
         try cmd.update_index.run(allocator, args);
+    } else if (std.mem.eql(u8, command, "submodule")) {
+        try cmd.submodule.run(allocator, ".git", args);
     } else {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "forge: '{s}' is not a forge command. See 'forge --help'.\n", .{command}) catch {
