@@ -93,7 +93,7 @@ forge lfs pull
 forge/
 ├── src/
 │   ├── cmd/          # CLI commands (init, add, commit, rebase, submodule, etc.)
-│   ├── rebase/       # Interactive rebase engine (todo, conflict resolution)
+│   ├── rebase/       # Interactive rebase engine (edit, squash, reorder, conflicts)
 │   ├── merge/        # Three-way merge with conflict detection
 │   ├── submodule/    # Submodule config, status, .gitmodules parsing
 │   ├── lfs/          # LFS pointer files, batch API, smudge/clean filters
@@ -107,13 +107,14 @@ forge/
 └── build.zig
 ```
 
-## Not Yet Implemented
+## Additional Features (v0.2)
 
-- Pack file generation (for push data transfer)
-- Proper zlib compression (using system zlib for now)
-- SSH authentication (HTTP basic auth works)
-- Shallow clones
-- Worktrees
+- LFS support (pointer files, batch API, smudge/clean filters)
+- Interactive rebase (edit, squash, reorder, conflict resolution)
+- Three-way merge with conflict markers
+- Submodule init/update/status/sync
+- SSH transport (shell out to ssh command)
+- Pack file generation and delta compression
 
 ## License
 
