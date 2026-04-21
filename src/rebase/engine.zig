@@ -426,8 +426,6 @@ pub const RebaseEngine = struct {
         discard_msg: bool,
         state: *RebaseState,
     ) !bool {
-        _ = state;
-        _ = discard_msg;
         // Read the commit to squash
         const commit_data = try self.store.read(self.allocator, commit_hash);
         defer self.allocator.free(commit_data);
@@ -435,13 +433,114 @@ pub const RebaseEngine = struct {
         const commit = try commit_mod.parse(self.allocator, commit_data);
         defer @constCast(&commit).deinit();
 
-        // For squash, we need to:
-        // 1. Apply changes from this commit
-        // 2. Amend the previous commit
-        // This is simplified - full impl needs tree merging
-        // TODO: Implement full squash with tree merging
+        // Read current HEAD commit (the one we're squashing into)
+        const head_data = try self.store.read(self.allocator, state.head);
+        defer self.allocator.free(head_data);
+
+        const head_commit = try commit_mod.parse(self.allocator, head_data);
+        defer @constCast(&head_commit).deinit();
+
+        // Get the parent of current HEAD (this is the base for our merge)
+        var base_tree: ?hash_mod.Sha1 = null;
+        var original_parent: hash_mod.Sha1 = state.onto;
+        if (head_commit.parents.len > 0) {
+            original_parent = head_commit.parents[0];
+            const parent_data = try self.store.read(self.allocator, original_parent);
+            defer self.allocator.free(parent_data);
+            const parent_commit = try commit_mod.parse(self.allocator, parent_data);
+            defer @constCast(&parent_commit).deinit();
+            base_tree = parent_commit.tree;
+        }
+
+        // Get the commit-to-squash's parent tree for its changes
+        var squash_base_tree: ?hash_mod.Sha1 = null;
+        if (commit.parents.len > 0) {
+            const squash_parent_data = try self.store.read(self.allocator, commit.parents[0]);
+            defer self.allocator.free(squash_parent_data);
+            const squash_parent = try commit_mod.parse(self.allocator, squash_parent_data);
+            defer @constCast(&squash_parent).deinit();
+            squash_base_tree = squash_parent.tree;
+        }
+
+        // Three-way merge: apply changes from commit onto head_commit's tree
+        // Base: parent of commit being squashed
+        // Ours: current HEAD tree
+        // Theirs: commit being squashed tree
+        const merge_result = try merge_mod.mergeTrees(
+            self.allocator,
+            self.store,
+            squash_base_tree,
+            head_commit.tree,
+            commit.tree,
+            .{
+                .ours_label = "HEAD",
+                .theirs_label = commit_hash.toHex()[0..7],
+            },
+        );
+        defer self.allocator.free(merge_result.conflicts);
+
+        // Check for conflicts
+        if (merge_result.conflicts.len > 0) {
+            try self.writeConflicts(merge_result.conflicts);
+            // Save message for later if not discarding
+            if (!discard_msg) {
+                const combined = try combineMessages(self.allocator, head_commit.message, commit.message);
+                if (state.squash_msg.len > 0) {
+                    self.allocator.free(state.squash_msg);
+                }
+                state.squash_msg = combined;
+            }
+            return true; // Stop for conflict resolution
+        }
+
+        // Combine messages (for squash) or keep original (for fixup)
+        const final_message = if (discard_msg)
+            try self.allocator.dupe(u8, head_commit.message)
+        else blk: {
+            // If we have accumulated squash messages, combine with those
+            if (state.squash_msg.len > 0) {
+                const combined = try combineMessages(self.allocator, state.squash_msg, commit.message);
+                self.allocator.free(state.squash_msg);
+                state.squash_msg = "";
+                break :blk combined;
+            }
+            break :blk try combineMessages(self.allocator, head_commit.message, commit.message);
+        };
+        defer self.allocator.free(final_message);
+
+        // Create new commit that replaces the current HEAD
+        // Parent should be the same as HEAD's parent (we're amending HEAD)
+        const new_commit_hash = try self.createCommit(
+            merge_result.tree,
+            original_parent,
+            head_commit.author,
+            head_commit.author_time,
+            head_commit.author_tz,
+            final_message,
+        );
+
+        state.head = new_commit_hash;
+        try self.refs.updateHead(new_commit_hash);
 
         return false;
+    }
+
+    /// Combine two commit messages with a blank line separator
+    pub fn combineMessages(allocator: std.mem.Allocator, first: []const u8, second: []const u8) ![]u8 {
+        // Trim trailing whitespace from first message
+        const first_trimmed = std.mem.trimRight(u8, first, " \t\n\r");
+
+        // Trim leading/trailing whitespace from second message
+        const second_trimmed = std.mem.trim(u8, second, " \t\n\r");
+
+        // Format: first message, blank line, "# This is a squashed commit:", second message
+        return std.fmt.allocPrint(allocator,
+            \\{s}
+            \\
+            \\# This is a squash of the following commit:
+            \\
+            \\{s}
+        , .{ first_trimmed, second_trimmed });
     }
 
     /// Execute a shell command
@@ -532,4 +631,98 @@ test "rebase state serialization" {
     try std.testing.expectEqual(@as(usize, 3), deserialized.current);
     try std.testing.expectEqual(@as(usize, 10), deserialized.total);
     try std.testing.expect(deserialized.stopped);
+}
+
+test "combineMessages - simple messages" {
+    const allocator = std.testing.allocator;
+
+    const first = "First commit message";
+    const second = "Second commit message";
+
+    const combined = try RebaseEngine.combineMessages(allocator, first, second);
+    defer allocator.free(combined);
+
+    try std.testing.expect(std.mem.indexOf(u8, combined, "First commit message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, combined, "Second commit message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, combined, "squash") != null);
+}
+
+test "combineMessages - messages with trailing whitespace" {
+    const allocator = std.testing.allocator;
+
+    const first = "First commit\n\n\n";
+    const second = "\n\nSecond commit\n";
+
+    const combined = try RebaseEngine.combineMessages(allocator, first, second);
+    defer allocator.free(combined);
+
+    // Should trim whitespace properly
+    try std.testing.expect(std.mem.indexOf(u8, combined, "First commit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, combined, "Second commit") != null);
+}
+
+test "combineMessages - multi-line messages" {
+    const allocator = std.testing.allocator;
+
+    const first =
+        \\Add feature X
+        \\
+        \\This commit adds feature X with the following:
+        \\- Item 1
+        \\- Item 2
+    ;
+    const second =
+        \\Fix bug in feature X
+        \\
+        \\The previous implementation had a bug.
+    ;
+
+    const combined = try RebaseEngine.combineMessages(allocator, first, second);
+    defer allocator.free(combined);
+
+    try std.testing.expect(std.mem.indexOf(u8, combined, "Add feature X") != null);
+    try std.testing.expect(std.mem.indexOf(u8, combined, "Item 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, combined, "Fix bug in feature X") != null);
+}
+
+test "rebase state with squash_msg" {
+    const allocator = std.testing.allocator;
+
+    var state = RebaseState{
+        .head_name = try allocator.dupe(u8, "refs/heads/feature"),
+        .orig_head = hash_mod.Sha1.fromHex("abc1234567890123456789012345678901234567".*) catch unreachable,
+        .onto = hash_mod.Sha1.fromHex("def1234567890123456789012345678901234567".*) catch unreachable,
+        .head = hash_mod.Sha1.fromHex("123456789012345678901234567890abcdef0123".*) catch unreachable,
+        .current = 0,
+        .total = 3,
+        .stopped = false,
+        .squash_msg = try allocator.dupe(u8, "Accumulated squash message"),
+        .allocator = allocator,
+    };
+    defer state.deinit();
+
+    try std.testing.expectEqualStrings("Accumulated squash message", state.squash_msg);
+    try std.testing.expectEqualStrings("refs/heads/feature", state.head_name);
+}
+
+test "rebase state deserialization with stopped=false" {
+    const allocator = std.testing.allocator;
+
+    const data =
+        \\head_name=refs/heads/main
+        \\orig_head=abc1234567890123456789012345678901234567
+        \\onto=def1234567890123456789012345678901234567
+        \\head=123456789012345678901234567890abcdef0123
+        \\current=5
+        \\total=8
+        \\stopped=0
+        \\
+    ;
+
+    var state = try RebaseState.deserialize(allocator, data);
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), state.current);
+    try std.testing.expectEqual(@as(usize, 8), state.total);
+    try std.testing.expect(!state.stopped);
 }

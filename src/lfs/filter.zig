@@ -40,13 +40,37 @@ pub const CleanFilter = struct {
                 .oid = &ptr.oid,
                 .size = ptr.size,
             }};
-            const response = client.batchUpload(&objects) catch |err| {
+            var response = client.batchUpload(&objects) catch |err| {
                 // Log but don't fail - upload can happen later
-                std.log.warn("LFS upload failed: {}", .{err});
+                std.log.warn("LFS batch upload request failed: {}", .{err});
                 return try ptr.format(self.allocator);
             };
-            _ = response;
-            // TODO: actually upload content via action.upload.href
+            defer client.freeBatchResponse(&response);
+
+            // Upload each object that needs uploading
+            for (response.objects) |obj| {
+                if (obj.@"error") |e| {
+                    std.log.warn("LFS server error for {s}: {s}", .{ obj.oid, e.message });
+                    continue;
+                }
+
+                if (obj.actions) |actions| {
+                    // Upload the content
+                    if (actions.upload) |upload_action| {
+                        client.upload(&upload_action, content) catch |err| {
+                            std.log.warn("LFS upload failed for {s}: {}", .{ obj.oid, err });
+                            continue;
+                        };
+
+                        // Verify upload if server provides verify action
+                        if (actions.verify) |verify_action| {
+                            client.verify(&verify_action, &ptr.oid, ptr.size) catch |err| {
+                                std.log.warn("LFS verify failed for {s}: {}", .{ obj.oid, err });
+                            };
+                        }
+                    }
+                }
+            }
         }
 
         return try ptr.format(self.allocator);
@@ -83,20 +107,67 @@ pub const SmudgeFilter = struct {
                 .oid = &ptr.oid,
                 .size = ptr.size,
             }};
-            const response = client.batchDownload(&objects) catch |err| {
-                std.log.warn("LFS download failed: {}", .{err});
+            var response = client.batchDownload(&objects) catch |err| {
+                std.log.warn("LFS batch download request failed: {}", .{err});
                 // Return pointer content if download fails
                 return self.allocator.dupe(u8, content);
             };
-            _ = response;
-            // TODO: actually download content via action.download.href
-            // and store locally before returning
+            defer client.freeBatchResponse(&response);
+
+            // Download the object
+            for (response.objects) |obj| {
+                if (obj.@"error") |e| {
+                    std.log.warn("LFS server error for {s}: {s}", .{ obj.oid, e.message });
+                    continue;
+                }
+
+                if (obj.actions) |actions| {
+                    if (actions.download) |download_action| {
+                        const downloaded = client.download(&download_action) catch |err| {
+                            std.log.warn("LFS download failed for {s}: {}", .{ obj.oid, err });
+                            continue;
+                        };
+                        errdefer self.allocator.free(downloaded);
+
+                        // Verify SHA-256 hash matches
+                        if (!verifyHash(downloaded, &ptr.oid)) {
+                            std.log.warn("LFS hash mismatch for {s}", .{obj.oid});
+                            self.allocator.free(downloaded);
+                            continue;
+                        }
+
+                        // Store locally for future use
+                        self.store.writeObject(&ptr.oid, downloaded) catch |err| {
+                            std.log.warn("Failed to cache LFS object {s}: {}", .{ obj.oid, err });
+                        };
+
+                        return downloaded;
+                    }
+                }
+            }
         }
 
         // Return pointer content if we can't get the actual content
         return self.allocator.dupe(u8, content);
     }
 };
+
+/// Verify SHA-256 hash of content matches expected OID
+fn verifyHash(content: []const u8, expected_oid: []const u8) bool {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(content);
+    const digest = hasher.finalResult();
+
+    // Convert to hex and compare
+    const hex_chars = "0123456789abcdef";
+    var computed_oid: [64]u8 = undefined;
+    for (digest, 0..) |byte, i| {
+        computed_oid[i * 2] = hex_chars[byte >> 4];
+        computed_oid[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+
+    return std.mem.eql(u8, &computed_oid, expected_oid);
+}
 
 /// Check if a path matches LFS tracking patterns
 pub fn isTracked(path: []const u8, patterns: []const []const u8) bool {
@@ -203,4 +274,93 @@ test "isTracked" {
     try std.testing.expect(isTracked("archive.zip", patterns));
     try std.testing.expect(isTracked("large/file.dat", patterns));
     try std.testing.expect(!isTracked("file.txt", patterns));
+}
+
+test "verifyHash - valid hash" {
+    const content = "Hello, LFS!";
+    // SHA-256 of "Hello, LFS!"
+    const expected_oid = "969ada5a96b2d122a71a1d8da0f7cdf99ef19d46d5613e7be4ac07dbb6724bfa";
+    try std.testing.expect(verifyHash(content, expected_oid));
+}
+
+test "verifyHash - invalid hash" {
+    const content = "Hello, LFS!";
+    const wrong_oid = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expect(!verifyHash(content, wrong_oid));
+}
+
+test "verifyHash - empty content" {
+    const content = "";
+    // SHA-256 of empty string
+    const expected_oid = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    try std.testing.expect(verifyHash(content, expected_oid));
+}
+
+test "CleanFilter - small file passthrough" {
+    const allocator = std.testing.allocator;
+
+    // Create a mock object store (won't actually write)
+    var store = try ObjectStore.init(allocator, "/tmp/test-lfs");
+    defer store.deinit();
+
+    var filter = CleanFilter{
+        .allocator = allocator,
+        .store = &store,
+        .client = null,
+        .min_size = 100 * 1024, // 100KB minimum
+    };
+
+    const small_content = "This is a small file";
+    const result = try filter.process(small_content);
+    defer allocator.free(result);
+
+    // Should return original content since it's below min_size
+    try std.testing.expectEqualStrings(small_content, result);
+}
+
+test "CleanFilter - pointer passthrough" {
+    const allocator = std.testing.allocator;
+
+    var store = try ObjectStore.init(allocator, "/tmp/test-lfs");
+    defer store.deinit();
+
+    var filter = CleanFilter{
+        .allocator = allocator,
+        .store = &store,
+        .client = null,
+        .min_size = 0, // No minimum
+    };
+
+    const pointer_content =
+        \\version https://git-lfs.github.com/spec/v1
+        \\oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393
+        \\size 12345
+        \\
+    ;
+
+    const result = try filter.process(pointer_content);
+    defer allocator.free(result);
+
+    // Should return original pointer content unchanged
+    try std.testing.expectEqualStrings(pointer_content, result);
+}
+
+test "SmudgeFilter - non-pointer passthrough" {
+    const allocator = std.testing.allocator;
+
+    var store = try ObjectStore.init(allocator, "/tmp/test-lfs");
+    defer store.deinit();
+
+    var filter = SmudgeFilter{
+        .allocator = allocator,
+        .store = &store,
+        .client = null,
+    };
+
+    const regular_content = "This is regular file content";
+    const result = try filter.process(regular_content);
+    defer allocator.free(result);
+
+    // Should return original content unchanged
+    try std.testing.expectEqualStrings(regular_content, result);
 }

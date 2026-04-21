@@ -37,8 +37,14 @@ pub const SmudgeFilter = @import("filter.zig").SmudgeFilter;
 pub const isTracked = @import("filter.zig").isTracked;
 pub const parseGitAttributes = @import("filter.zig").parseGitAttributes;
 
+pub const HttpClient = @import("http.zig").HttpClient;
+pub const Headers = @import("http.zig").Headers;
+pub const Response = @import("http.zig").Response;
+pub const JsonParser = @import("http.zig").JsonParser;
+
 test {
     _ = @import("pointer.zig");
     _ = @import("api.zig");
     _ = @import("filter.zig");
+    _ = @import("http.zig");
 }

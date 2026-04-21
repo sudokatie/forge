@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Pointer = @import("pointer.zig").Pointer;
+const http = @import("http.zig");
 
 /// LFS API client for batch operations
 pub const Client = struct {
@@ -70,27 +71,270 @@ pub const Client = struct {
 
     /// Perform batch API request
     fn batch(self: *Self, operation: []const u8, objects: []const BatchObject) !BatchResponse {
-        _ = self;
-        _ = operation;
-        _ = objects;
-        // HTTP client implementation would go here
-        // For now, return a stub error
-        return error.NotImplemented;
+        // Build request body
+        var obj_list = std.ArrayListUnmanaged(http.BatchObjectInfo){};
+        defer obj_list.deinit(self.allocator);
+
+        for (objects) |obj| {
+            try obj_list.append(self.allocator, .{ .oid = obj.oid, .size = obj.size });
+        }
+
+        const request_body = try http.buildBatchRequest(self.allocator, operation, obj_list.items);
+        defer self.allocator.free(request_body);
+
+        // Build URL
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/objects/batch", .{self.endpoint});
+        defer self.allocator.free(url);
+
+        // Set up headers
+        var headers = http.Headers.init(self.allocator);
+        defer headers.deinit();
+
+        try headers.put("Content-Type", "application/vnd.git-lfs+json");
+        try headers.put("Accept", "application/vnd.git-lfs+json");
+
+        if (self.auth_token) |token| {
+            const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
+            defer self.allocator.free(auth_value);
+            try headers.put("Authorization", auth_value);
+        }
+
+        // Make HTTP request
+        var client = http.HttpClient.init(self.allocator);
+        var response = try client.httpPost(url, &headers, request_body);
+        defer response.deinit();
+
+        if (response.status_code != 200) {
+            return error.BatchRequestFailed;
+        }
+
+        // Parse JSON response
+        return try self.parseBatchResponse(response.body);
+    }
+
+    /// Parse batch API JSON response
+    fn parseBatchResponse(self: *Self, body: []const u8) !BatchResponse {
+        var parser = http.JsonParser.init(self.allocator, body);
+        var json = try parser.parse();
+        defer json.deinit(self.allocator);
+
+        var response_objects = std.ArrayListUnmanaged(ResponseObject){};
+        errdefer {
+            for (response_objects.items) |*obj| {
+                self.allocator.free(obj.oid);
+                if (obj.actions) |*acts| {
+                    if (acts.download) |*d| self.freeAction(d);
+                    if (acts.upload) |*u| self.freeAction(u);
+                    if (acts.verify) |*v| self.freeAction(v);
+                }
+            }
+            response_objects.deinit(self.allocator);
+        }
+
+        const transfer = if (json.get("transfer")) |t| t.getString() orelse "basic" else "basic";
+        const hash_algo = if (json.get("hash_algo")) |h| h.getString() orelse "sha256" else "sha256";
+
+        if (json.get("objects")) |objects_val| {
+            if (objects_val.getArray()) |objects_arr| {
+                for (objects_arr) |obj| {
+                    var resp_obj = ResponseObject{
+                        .oid = try self.allocator.dupe(u8, obj.get("oid").?.getString().?),
+                        .size = @intCast(obj.get("size").?.getNumber().?),
+                        .authenticated = if (obj.get("authenticated")) |a| a.getBool() orelse false else false,
+                        .actions = null,
+                        .@"error" = null,
+                    };
+
+                    if (obj.get("actions")) |actions| {
+                        resp_obj.actions = .{
+                            .download = try self.parseAction(actions.get("download")),
+                            .upload = try self.parseAction(actions.get("upload")),
+                            .verify = try self.parseAction(actions.get("verify")),
+                        };
+                    }
+
+                    try response_objects.append(self.allocator, resp_obj);
+                }
+            }
+        }
+
+        return BatchResponse{
+            .transfer = try self.allocator.dupe(u8, transfer),
+            .objects = try response_objects.toOwnedSlice(self.allocator),
+            .hash_algo = try self.allocator.dupe(u8, hash_algo),
+        };
+    }
+
+    /// Parse a single action from JSON
+    fn parseAction(self: *Self, action_val: ?http.JsonParser.Value) !?Action {
+        const action = action_val orelse return null;
+
+        const href = action.get("href").?.getString() orelse return null;
+
+        var header_map: ?std.StringHashMap([]const u8) = null;
+        if (action.get("header")) |hdr_obj| {
+            if (hdr_obj == .object) {
+                header_map = std.StringHashMap([]const u8).init(self.allocator);
+                var iter = hdr_obj.object.iterator();
+                while (iter.next()) |entry| {
+                    if (entry.value_ptr.getString()) |val| {
+                        try header_map.?.put(
+                            try self.allocator.dupe(u8, entry.key_ptr.*),
+                            try self.allocator.dupe(u8, val),
+                        );
+                    }
+                }
+            }
+        }
+
+        return Action{
+            .href = try self.allocator.dupe(u8, href),
+            .header = header_map,
+            .expires_in = if (action.get("expires_in")) |e| e.getNumber() else null,
+            .expires_at = if (action.get("expires_at")) |e| blk: {
+                if (e.getString()) |s| {
+                    break :blk try self.allocator.dupe(u8, s);
+                }
+                break :blk null;
+            } else null,
+        };
+    }
+
+    /// Free an action's allocated memory
+    fn freeAction(self: *Self, action: *Action) void {
+        self.allocator.free(action.href);
+        if (action.header) |*hdr| {
+            var iter = hdr.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            hdr.deinit();
+        }
+        if (action.expires_at) |e| self.allocator.free(e);
     }
 
     /// Download object content from LFS server
     pub fn download(self: *Self, action: *const Action) ![]u8 {
-        _ = self;
-        _ = action;
-        return error.NotImplemented;
+        var headers = http.Headers.init(self.allocator);
+        defer headers.deinit();
+
+        // Add action-specific headers
+        if (action.header) |action_headers| {
+            var iter = action_headers.iterator();
+            while (iter.next()) |entry| {
+                try headers.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+
+        // Add auth if available and not already in action headers
+        if (self.auth_token) |token| {
+            if (headers.get("Authorization") == null) {
+                const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
+                defer self.allocator.free(auth_value);
+                try headers.put("Authorization", auth_value);
+            }
+        }
+
+        var client = http.HttpClient.init(self.allocator);
+        var response = try client.httpGet(action.href, &headers);
+        defer {
+            response.headers.deinit();
+            // Don't free body - we're returning it
+        }
+
+        if (response.status_code != 200) {
+            self.allocator.free(response.body);
+            return error.DownloadFailed;
+        }
+
+        return response.body;
     }
 
     /// Upload object content to LFS server
     pub fn upload(self: *Self, action: *const Action, content: []const u8) !void {
-        _ = self;
-        _ = action;
-        _ = content;
-        return error.NotImplemented;
+        var headers = http.Headers.init(self.allocator);
+        defer headers.deinit();
+
+        try headers.put("Content-Type", "application/octet-stream");
+
+        // Add action-specific headers
+        if (action.header) |action_headers| {
+            var iter = action_headers.iterator();
+            while (iter.next()) |entry| {
+                try headers.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+
+        // Add auth if available and not already in action headers
+        if (self.auth_token) |token| {
+            if (headers.get("Authorization") == null) {
+                const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
+                defer self.allocator.free(auth_value);
+                try headers.put("Authorization", auth_value);
+            }
+        }
+
+        var client = http.HttpClient.init(self.allocator);
+        var response = try client.httpPut(action.href, &headers, content);
+        defer response.deinit();
+
+        // Accept 200, 201, or 204 as success
+        if (response.status_code != 200 and response.status_code != 201 and response.status_code != 204) {
+            return error.UploadFailed;
+        }
+    }
+
+    /// Verify upload with LFS server
+    pub fn verify(self: *Self, action: *const Action, oid: []const u8, size: u64) !void {
+        var headers = http.Headers.init(self.allocator);
+        defer headers.deinit();
+
+        try headers.put("Content-Type", "application/vnd.git-lfs+json");
+        try headers.put("Accept", "application/vnd.git-lfs+json");
+
+        // Add action-specific headers
+        if (action.header) |action_headers| {
+            var iter = action_headers.iterator();
+            while (iter.next()) |entry| {
+                try headers.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+
+        if (self.auth_token) |token| {
+            if (headers.get("Authorization") == null) {
+                const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
+                defer self.allocator.free(auth_value);
+                try headers.put("Authorization", auth_value);
+            }
+        }
+
+        // Build verify request body
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"oid\":\"{s}\",\"size\":{d}}}", .{ oid, size });
+        defer self.allocator.free(body);
+
+        var client = http.HttpClient.init(self.allocator);
+        var response = try client.httpPost(action.href, &headers, body);
+        defer response.deinit();
+
+        if (response.status_code != 200 and response.status_code != 204) {
+            return error.VerifyFailed;
+        }
+    }
+
+    /// Free a BatchResponse
+    pub fn freeBatchResponse(self: *Self, response: *BatchResponse) void {
+        self.allocator.free(response.transfer);
+        self.allocator.free(response.hash_algo);
+        for (response.objects) |*obj| {
+            self.allocator.free(obj.oid);
+            if (obj.actions) |*acts| {
+                if (acts.download) |*d| self.freeAction(@constCast(d));
+                if (acts.upload) |*u| self.freeAction(@constCast(u));
+                if (acts.verify) |*v| self.freeAction(@constCast(v));
+            }
+        }
+        self.allocator.free(response.objects);
     }
 
     /// Derive LFS endpoint from git remote URL
