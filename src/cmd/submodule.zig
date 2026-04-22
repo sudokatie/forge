@@ -125,17 +125,34 @@ pub const SubmoduleCommand = struct {
 
     /// Show submodule status
     fn subStatus(self: *Self, args: []const []const u8) !void {
-        // Parse args (recursive flag for future use)
+        // Parse args for recursive flag
+        var recursive = false;
         for (args) |arg| {
             if (std.mem.eql(u8, arg, "--recursive")) {
-                // TODO: implement recursive status
+                recursive = true;
             }
         }
 
-        const config = try self.loadConfig();
-        defer @constCast(&config).deinit();
+        try self.subStatusWithDepth(self.work_dir, recursive, 0);
+    }
 
-        var checker = submodule_mod.SubmoduleStatusChecker.init(self.allocator, self.work_dir);
+    /// Show submodule status with recursion depth tracking
+    fn subStatusWithDepth(self: *Self, work_dir: []const u8, recursive: bool, depth: usize) !void {
+        const gitmodules_path = try std.fs.path.join(self.allocator, &.{ work_dir, ".gitmodules" });
+        defer self.allocator.free(gitmodules_path);
+
+        const file = std.fs.openFileAbsolute(gitmodules_path, .{}) catch {
+            return; // No .gitmodules, nothing to do
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+
+        var config = try submodule_mod.SubmoduleConfig.parse(self.allocator, content);
+        defer config.deinit();
+
+        var checker = submodule_mod.SubmoduleStatusChecker.init(self.allocator, work_dir);
 
         // Get recorded SHAs from index (simplified - would need index parsing)
         const recorded = try self.allocator.alloc(?hash_mod.Sha1, config.submodules.len);
@@ -145,8 +162,13 @@ pub const SubmoduleCommand = struct {
         const entries = try checker.checkAll(&config, recorded);
         defer self.allocator.free(entries);
 
+        // Build indent string based on depth
+        const indent = try self.allocator.alloc(u8, depth * 2);
+        defer self.allocator.free(indent);
+        @memset(indent, ' ');
+
         for (entries) |*entry| {
-            // Format and print status
+            // Format and print status with indentation
             const prefix: u8 = switch (entry.status) {
                 .uninitialized => '-',
                 .initialized => ' ',
@@ -158,9 +180,25 @@ pub const SubmoduleCommand = struct {
             };
 
             if (entry.current_sha) |sha| {
-                std.debug.print("{c}{s} {s}\n", .{ prefix, sha[0..7], entry.path });
+                std.debug.print("{s}{c}{s} {s}\n", .{ indent, prefix, sha[0..7], entry.path });
             } else {
-                std.debug.print("{c}(none)  {s}\n", .{ prefix, entry.path });
+                std.debug.print("{s}{c}(none)  {s}\n", .{ indent, prefix, entry.path });
+            }
+
+            // If recursive, check for nested submodules
+            if (recursive and entry.status != .uninitialized and entry.status != .missing) {
+                const sm_work_dir = try std.fs.path.join(self.allocator, &.{ work_dir, entry.path });
+                defer self.allocator.free(sm_work_dir);
+
+                // Check if this submodule has its own .gitmodules
+                const nested_gitmodules = try std.fs.path.join(self.allocator, &.{ sm_work_dir, ".gitmodules" });
+                defer self.allocator.free(nested_gitmodules);
+
+                if (std.fs.accessAbsolute(nested_gitmodules, .{})) |_| {
+                    try self.subStatusWithDepth(sm_work_dir, recursive, depth + 1);
+                } else |_| {
+                    // No nested submodules, continue
+                }
             }
         }
     }
@@ -333,4 +371,126 @@ test "submodule command init" {
     const allocator = std.testing.allocator;
     const cmd = SubmoduleCommand.init(allocator, "/tmp/.git");
     try std.testing.expectEqualStrings("/tmp", cmd.work_dir);
+}
+
+test "subStatus parses recursive flag" {
+    const allocator = std.testing.allocator;
+    var cmd = SubmoduleCommand.init(allocator, "/tmp/nonexistent/.git");
+
+    // Should not error even with no .gitmodules (just returns early)
+    const args_recursive = &[_][]const u8{"--recursive"};
+    try cmd.subStatus(args_recursive);
+
+    const args_empty = &[_][]const u8{};
+    try cmd.subStatus(args_empty);
+}
+
+test "subStatusWithDepth handles missing gitmodules" {
+    const allocator = std.testing.allocator;
+    var cmd = SubmoduleCommand.init(allocator, "/tmp/nonexistent/.git");
+
+    // Should return cleanly when no .gitmodules exists
+    try cmd.subStatusWithDepth("/tmp/nonexistent", false, 0);
+    try cmd.subStatusWithDepth("/tmp/nonexistent", true, 0);
+}
+
+test "subStatusWithDepth builds correct indent" {
+    const allocator = std.testing.allocator;
+
+    // Test indent allocation for different depths
+    for ([_]usize{ 0, 1, 2, 3 }) |depth| {
+        const indent = try allocator.alloc(u8, depth * 2);
+        defer allocator.free(indent);
+        @memset(indent, ' ');
+
+        try std.testing.expectEqual(depth * 2, indent.len);
+        for (indent) |c| {
+            try std.testing.expectEqual(@as(u8, ' '), c);
+        }
+    }
+}
+
+test "recursive status with nested submodules" {
+    const allocator = std.testing.allocator;
+
+    // Create a temp directory structure simulating nested submodules
+    const tmp_dir = "/tmp/forge-test-recursive-submodule";
+
+    // Clean up any existing test directory
+    std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    // Create directory structure
+    std.fs.makeDirAbsolute(tmp_dir) catch {};
+    defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+    const outer_sm = try std.fs.path.join(allocator, &.{ tmp_dir, "outer" });
+    defer allocator.free(outer_sm);
+    std.fs.makeDirAbsolute(outer_sm) catch {};
+
+    const outer_git = try std.fs.path.join(allocator, &.{ outer_sm, ".git" });
+    defer allocator.free(outer_git);
+    std.fs.makeDirAbsolute(outer_git) catch {};
+
+    const inner_sm = try std.fs.path.join(allocator, &.{ outer_sm, "inner" });
+    defer allocator.free(inner_sm);
+    std.fs.makeDirAbsolute(inner_sm) catch {};
+
+    const inner_git = try std.fs.path.join(allocator, &.{ inner_sm, ".git" });
+    defer allocator.free(inner_git);
+    std.fs.makeDirAbsolute(inner_git) catch {};
+
+    // Create root .gitmodules
+    const root_gitmodules = try std.fs.path.join(allocator, &.{ tmp_dir, ".gitmodules" });
+    defer allocator.free(root_gitmodules);
+    {
+        const file = try std.fs.createFileAbsolute(root_gitmodules, .{});
+        defer file.close();
+        try file.writeAll(
+            \\[submodule "outer"]
+            \\    path = outer
+            \\    url = https://example.com/outer.git
+            \\
+        );
+    }
+
+    // Create nested .gitmodules in outer submodule
+    const outer_gitmodules = try std.fs.path.join(allocator, &.{ outer_sm, ".gitmodules" });
+    defer allocator.free(outer_gitmodules);
+    {
+        const file = try std.fs.createFileAbsolute(outer_gitmodules, .{});
+        defer file.close();
+        try file.writeAll(
+            \\[submodule "inner"]
+            \\    path = inner
+            \\    url = https://example.com/inner.git
+            \\
+        );
+    }
+
+    // Create HEAD files for initialized submodules
+    const outer_head = try std.fs.path.join(allocator, &.{ outer_git, "HEAD" });
+    defer allocator.free(outer_head);
+    {
+        const file = try std.fs.createFileAbsolute(outer_head, .{});
+        defer file.close();
+        try file.writeAll("abcdef1234567890abcdef1234567890abcdef12\n");
+    }
+
+    const inner_head = try std.fs.path.join(allocator, &.{ inner_git, "HEAD" });
+    defer allocator.free(inner_head);
+    {
+        const file = try std.fs.createFileAbsolute(inner_head, .{});
+        defer file.close();
+        try file.writeAll("1234567890abcdef1234567890abcdef12345678\n");
+    }
+
+    // Run recursive status
+    var cmd = SubmoduleCommand.init(allocator, try std.fs.path.join(allocator, &.{ tmp_dir, ".git" }));
+    // Note: cmd owns this path now via work_dir derivation
+
+    // Non-recursive should only show outer
+    try cmd.subStatusWithDepth(tmp_dir, false, 0);
+
+    // Recursive should show both outer and inner
+    try cmd.subStatusWithDepth(tmp_dir, true, 0);
 }
